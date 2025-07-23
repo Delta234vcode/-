@@ -1,0 +1,9 @@
+# requirements.txt
+python-dotenv
+openai
+python-telegram-bot
+MetaTrader5
+pandas
+pandas_ta
+websockets
+asyncio

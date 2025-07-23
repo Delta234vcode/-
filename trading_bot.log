@@ -1,0 +1,4 @@
+2025-07-22 17:16:26,229 - CRITICAL - Помилка ініціалізації клієнтів API: The api_key client option must be set either by passing api_key to the client or by setting the OPENAI_API_KEY environment variable
+2025-07-22 17:21:03,813 - INFO - Клієнти OpenAI та Telegram успішно ініціалізовані.
+2025-07-22 17:21:03,823 - CRITICAL - Не вдалося ініціалізувати MetaTrader 5. Перевірте, чи запущений термінал.
+2025-07-22 17:21:03,823 - CRITICAL - Вихід з програми через помилку підключення до MT5.
