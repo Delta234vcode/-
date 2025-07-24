@@ -4,7 +4,14 @@ import asyncio
 import json
 import logging
 import time
+import sys
 from typing import Optional, Tuple
+
+# Налаштування кодування для Windows
+if sys.platform == "win32":
+    import codecs
+    sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
+    sys.stderr = codecs.getwriter("utf-8")(sys.stderr.detach())
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -12,8 +19,28 @@ import pandas_ta as ta
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telegram import Bot
-from websockets.client import connect
-from websockets.exceptions import ConnectionClosed
+import threading
+import datetime
+from telegram.ext import Application, CommandHandler, ContextTypes
+import requests
+
+TRADE_LOG_FILE = "trade_results.json"
+trade_log_lock = threading.Lock()
+
+def log_trade_result(trade_data):
+    """Зберігає результат угоди у JSON-файл."""
+    with trade_log_lock:
+        try:
+            if os.path.exists(TRADE_LOG_FILE):
+                with open(TRADE_LOG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                data = []
+            data.append(trade_data)
+            with open(TRADE_LOG_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.error(f"Помилка збереження trade log: {e}")
 
 # --- 1. КОНФІГУРАЦІЯ ТА ІНІЦІАЛІЗАЦІЯ ---
 
@@ -23,14 +50,14 @@ load_dotenv()
 
 # --- Налаштування ключів API та ID (з файлу .env) ---
 # Важливо: Ніколи не зберігайте ключі прямо в коді!
-BENZINGA_API_KEY = os.getenv("BENZINGA_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY") or "ТВІЙ_КЛЮЧ"
 
 # --- Налаштування торгівлі ---
-RISK_PERCENT = 1.0  # Ризик на одну угоду у відсотках. 1.0 = 1% від балансу. НЕ РЕКОМЕНДУЄТЬСЯ > 2.0
+RISK_PERCENT = 10.0  # Ризик на одну угоду у відсотках. 10.0 = 10% від балансу. НЕ РЕКОМЕНДУЄТЬСЯ > 10.0
 ATR_TIMEFRAME = mt5.TIMEFRAME_M15  # Таймфрейм для розрахунку ATR
 ATR_PERIOD = 14  # Період ATR
 ATR_SL_MULTIPLIER = 1.5  # Множник ATR для Stop Loss
@@ -44,12 +71,84 @@ IMPORTANT_KEYWORDS = [
     "fed", "ecb", "boj", "boe", "fomc", "inflation", "retail sales"
 ]
 
+# --- Розширена фільтрація новин ---
+# Whitelist/Blacklist ключових слів
+NEWS_WHITELIST = [
+    # Макроекономіка
+    "rate hike", "rate cut", "interest rate", "fed decision", "fomc", "ecb", "boj", "boe", "central bank", "policy statement", "minutes", "gdp", "cpi", "ppi", "inflation", "unemployment", "jobs report", "nfp", "non-farm", "retail sales", "trade balance", "manufacturing", "services pmi", "consumer confidence", "housing starts", "building permits", "core durable goods", "initial jobless claims", "ISM", "recession", "expansion", "deficit", "surplus", "stimulus", "taper", "quantitative easing", "qt", "yield curve", "bond auction", "downgrade", "upgrade", "credit rating", "default", "debt ceiling", "shutdown", "budget", "fiscal", "monetary",
+    # Геополітика та ризики
+    "war", "conflict", "sanctions", "tariffs", "trade war", "embargo", "summit", "agreement", "deal", "brexit", "election", "referendum", "protest", "strike", "emergency", "earthquake", "hurricane", "pandemic", "covid", "lockdown",
+    # Корпоративні новини
+    "earnings", "profit warning", "guidance", "dividend cut", "dividend increase", "buyback", "merger", "acquisition", "ipo", "bankruptcy", "chapter 11", "layoffs", "job cuts", "ceo resigns", "scandal", "investigation", "fine", "lawsuit", "settlement", "antitrust", "regulation", "approval", "fda", "clinical trial", "recall", "hack", "cyberattack", "data breach",
+    # Ринки та активи
+    "oil", "crude", "gold", "silver", "commodity", "opec", "supply cut", "output", "inventory", "production", "export", "import", "price cap", "price floor", "volatility", "flash crash", "limit up", "limit down", "halted", "circuit breaker",
+    # Додаткові важливі слова
+    "unexpected", "record high", "missed forecast", "surprise"
+]
+NEWS_BLACKLIST = [
+    "rumor", "speculation", "unconfirmed", "minor", "recall", "dividend", "buyback"
+]
+
+# Типи новин для фільтрації (можна розширити)
+IMPORTANT_NEWS_TYPES = ["economic", "earnings", "central_bank", "macro"]
+
+# Мінімальна важливість (impact) новини для торгівлі
+MIN_NEWS_IMPORTANCE = 2  # 1 - low, 2 - medium, 3 - high
+
+# --- Динамічний розмір лоту ---
+def dynamic_risk_percent(news_data):
+    """Визначає risk_percent залежно від важливості новини."""
+    impact = news_data.get('importance', 1)
+    if impact == 3:
+        return 10.0  # High impact
+    elif impact == 2:
+        return 5.0   # Medium impact
+    else:
+        return 2.0   # Low impact
+
+# --- Перевірка ринкових умов ---
+MIN_LIQUIDITY_HOUR = 6   # Не торгувати з 00:00 до 06:00 UTC
+MAX_SPREAD_POINTS = 30   # Максимально допустимий спред у пунктах
+
+# --- Трейлінг-стоп (структура, реалізація залежить від брокера/MT5) ---
+TRAILING_STOP_MULTIPLIER = 1.0  # 1 x ATR, можна налаштувати
+
+# --- Захист від дублювання угод ---
+open_positions = set()
+open_positions_lock = threading.Lock()
+
+# --- Мультистратегія (структура для майбутнього) ---
+STRATEGY_MODE = "news"  # news, trend, scalping, hybrid
+
+# --- Додаткове логування новин ---
+def log_news(news_data, filtered, reason=None):
+    with trade_log_lock:
+        try:
+            if os.path.exists("news_log.json"):
+                with open("news_log.json", "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                data = []
+            entry = {
+                "time": datetime.datetime.utcnow().isoformat(),
+                "title": news_data.get('title'),
+                "type": news_data.get('type'),
+                "impact": news_data.get('importance'),
+                "filtered": filtered,
+                "reason": reason
+            }
+            data.append(entry)
+            with open("news_log.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.error(f"Помилка збереження news log: {e}")
+
 # --- Ініціалізація логування ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("trading_bot.log"),
+        logging.FileHandler("trading_bot.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -213,165 +312,416 @@ def calculate_position_size(symbol: str, sl_pips: float) -> Optional[float]:
 
     return lot_size
 
+def check_market_conditions(symbol: str) -> bool:
+    """Перевіряє ринкові умови: ліквідність, спред, час."""
+    now = datetime.datetime.utcnow()
+    if now.hour < MIN_LIQUIDITY_HOUR:
+        logging.info(f"Не торгуємо вночі (UTC < {MIN_LIQUIDITY_HOUR})")
+        return False
+    tick = mt5.symbol_info_tick(symbol)
+    symbol_info = mt5.symbol_info(symbol)
+    if not tick or not symbol_info:
+        logging.warning(f"Не вдалося отримати tick/symbol_info для {symbol}")
+        return False
+    spread = abs(tick.ask - tick.bid) / symbol_info.point
+    if spread > MAX_SPREAD_POINTS:
+        logging.info(f"Завеликий спред для {symbol}: {spread} пунктів")
+        return False
+    return True
 
 # --- 4. ОСНОВНА ТОРГОВА ЛОГІКА ---
 
-async def execute_trade(action: str, symbol: str, reason: str):
-    """Виконує повний цикл відкриття угоди."""
+async def execute_trade(action: str, symbol: str, reason: str, news_received_time=None):
+    openai_response_time = datetime.datetime.utcnow()
     logging.info(f"Починаю процес відкриття угоди: {action} {symbol}")
 
-    symbol_info = mt5.symbol_info(symbol)
-    if not symbol_info or not symbol_info.visible:
-        msg = f"⚠️ Помилка: Символ {symbol} не знайдено або він не доступний для торгівлі у вашого брокера."
-        logging.error(msg)
-        await send_telegram_message(msg)
-        return
+    # --- Захист від дублювання угод ---
+    with open_positions_lock:
+        if symbol in open_positions:
+            logging.info(f"Вже є відкрита позиція по {symbol}, нову не відкриваємо.")
+            return
+        open_positions.add(symbol)
 
-    # 1. Отримати ATR
-    atr_value = calculate_atr(symbol)
-    if atr_value is None:
-        msg = f"⚠️ Помилка: Не вдалося розрахувати ATR для {symbol}."
-        logging.error(msg)
-        await send_telegram_message(msg)
-        return
+    try:
+        if not can_trade(symbol):
+            logging.info(f"Ліміт або cooldown: угода не відкривається.")
+            return
+        if not check_market_conditions(symbol):
+            logging.info(f"Ринкові умови не підходять для {symbol}, угода не відкривається.")
+            return
+        
+        symbol_info = mt5.symbol_info(symbol)
+        if not symbol_info or not symbol_info.visible:
+            msg = f"⚠️ Помилка: Символ {symbol} не знайдено або він не доступний для торгівлі у вашого брокера."
+            logging.error(msg)
+            await send_telegram_message(msg)
+            return
+        atr_value = calculate_atr(symbol)
+        if atr_value is None:
+            msg = f"⚠️ Помилка: Не вдалося розрахувати ATR для {symbol}."
+            logging.error(msg)
+            await send_telegram_message(msg)
+            return
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            msg = f"⚠️ Помилка: Не вдалося отримати поточну ціну для {symbol}."
+            logging.error(msg)
+            await send_telegram_message(msg)
+            return
+        price = tick.ask if action == "BUY" else tick.bid
+        point = symbol_info.point
+        # --- Трейлінг-стоп (додаємо до SL, якщо потрібно) ---
+        trailing_stop = atr_value * TRAILING_STOP_MULTIPLIER
+        # 3. Розрахувати SL і TP
+        if action == "BUY":
+            stop_loss = price - (atr_value * ATR_SL_MULTIPLIER)
+            take_profit = price + (atr_value * ATR_TP_MULTIPLIER)
+            trailing_sl = price - trailing_stop
+        else:  # SELL
+            stop_loss = price + (atr_value * ATR_SL_MULTIPLIER)
+            take_profit = price - (atr_value * ATR_TP_MULTIPLIER)
+            trailing_sl = price + trailing_stop
+        sl_pips = abs(price - stop_loss) / point
+        volume = calculate_position_size(symbol, sl_pips)
+        if volume is None or volume == 0:
+            msg = f"⚠️ Помилка: Не вдалося розрахувати розмір позиції для {symbol}."
+            logging.error(msg)
+            await send_telegram_message(msg)
+            return
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL,
+            "price": price,
+            "sl": stop_loss,
+            "tp": take_profit,
+            "deviation": 10,
+            "magic": MAGIC_NUMBER,
+            "comment": f"NewsBot: {reason[:20]}",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        trade_sent_time = datetime.datetime.utcnow()
+        latency = (trade_sent_time - news_received_time).total_seconds() if news_received_time else None
+        result = mt5.order_send(request)
+        if result is None:
+            msg = f"❌ Помилка відкриття ордеру для {symbol}. Код: Невідома помилка."
+            logging.error(msg)
+            await send_telegram_message(msg)
+        elif result.retcode == mt5.TRADE_RETCODE_DONE:
+            msg = (
+                f"✅ Угоду відкрито: {action} {symbol}\n"
+                f"🔹 Ціна входу: {result.price}\n"
+                f"🔹 Об'єм: {result.volume}\n"
+                f"🛑 Stop Loss: {result.sl}\n"
+                f"🎯 Take Profit: {result.tp}\n"
+                f"Reason: {reason}\n"
+                f"⏱️ Latency: {latency:.2f} сек."
+            )
+            logging.info(f"Угода {result.order} успішно відкрита. Latency: {latency}")
+            await send_telegram_message(msg)
+            log_trade_result({
+                "type": "open",
+                "order": result.order,
+                "symbol": symbol,
+                "action": action,
+                "volume": result.volume,
+                "price": result.price,
+                "sl": result.sl,
+                "tp": result.tp,
+                "trailing_sl": trailing_sl,
+                "reason": reason,
+                "open_time": trade_sent_time.isoformat(),
+                "latency": latency
+            })
+        else:
+            msg = (
+                f"❌ Помилка відкриття ордеру для {symbol}.\n"
+                f"Код: {result.retcode}\n"
+                f"Коментар: {result.comment}"
+            )
+            logging.error(msg)
+            await send_telegram_message(msg)
+    except Exception as e:
+        logging.error(f"Помилка під час виконання угоди: {e}")
+        await send_telegram_message(f"❌ Помилка під час виконання угоди: {e}")
+    finally:
+        # Видаляємо символ з відкритих позицій
+        with open_positions_lock:
+            open_positions.discard(symbol)
 
-    # 2. Отримати поточну ціну
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        msg = f"⚠️ Помилка: Не вдалося отримати поточну ціну для {symbol}."
-        logging.error(msg)
-        await send_telegram_message(msg)
-        return
-
-    price = tick.ask if action == "BUY" else tick.bid
-    point = symbol_info.point
-
-    # 3. Розрахувати SL і TP
-    if action == "BUY":
-        stop_loss = price - (atr_value * ATR_SL_MULTIPLIER)
-        take_profit = price + (atr_value * ATR_TP_MULTIPLIER)
-    else:  # SELL
-        stop_loss = price + (atr_value * ATR_SL_MULTIPLIER)
-        take_profit = price - (atr_value * ATR_TP_MULTIPLIER)
-    
-    sl_pips = abs(price - stop_loss) / point
-
-    # 4. Розрахувати розмір позиції
-    volume = calculate_position_size(symbol, sl_pips)
-    if volume is None or volume == 0:
-        msg = f"⚠️ Помилка: Не вдалося розрахувати розмір позиції для {symbol}."
-        logging.error(msg)
-        await send_telegram_message(msg)
-        return
-
-    # 5. Сформувати та відправити запит на ордер
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": volume,
-        "type": mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL,
-        "price": price,
-        "sl": stop_loss,
-        "tp": take_profit,
-        "deviation": 10, # Допустиме прослизання в пунктах
-        "magic": MAGIC_NUMBER,
-        "comment": f"NewsBot: {reason[:20]}",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC, # або FOK, залежить від брокера
-    }
-
-    result = mt5.order_send(request)
-
-    # 6. Обробити результат
-    if result is None:
-        msg = f"❌ Помилка відкриття ордеру для {symbol}. Код: Невідома помилка."
-        logging.error(msg)
-        await send_telegram_message(msg)
-    elif result.retcode == mt5.TRADE_RETCODE_DONE:
-        msg = (
-            f"✅ Угоду відкрито: {action} {symbol}\n"
-            f"🔹 Ціна входу: {result.price}\n"
-            f"🔹 Об'єм: {result.volume}\n"
-            f"🛑 Stop Loss: {result.sl}\n"
-            f"🎯 Take Profit: {result.tp}\n"
-            f"Reason: {reason}"
-        )
-        logging.info(f"Угода {result.order} успішно відкрита.")
-        await send_telegram_message(msg)
-    else:
-        msg = (
-            f"❌ Не вдалося відкрити ордер: {action} {symbol}\n"
-            f"Код помилки: {result.retcode} - {result.comment}"
-        )
-        logging.error(f"Помилка order_send: {result}")
-        await send_telegram_message(msg)
+# --- Відстеження закриття угод ---
+async def monitor_closed_trades():
+    global cooldown_until
+    last_ticket_set = set()
+    while True:
+        try:
+            closed_orders = mt5.history_deals_get(datetime.datetime.now() - datetime.timedelta(days=2), datetime.datetime.now())
+            if closed_orders:
+                for deal in closed_orders:
+                    if deal.type in [mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL] and deal.entry == 1:  # закриття позиції
+                        if deal.ticket not in last_ticket_set:
+                            last_ticket_set.add(deal.ticket)
+                            profit = deal.profit
+                            if profit < 0:
+                                cooldown_until = datetime.datetime.utcnow() + datetime.timedelta(seconds=COOLDOWN_AFTER_LOSS)
+                            msg = (
+                                f"❌ Угоду закрито: {deal.symbol}\n"
+                                f"Тип: {'BUY' if deal.type == mt5.DEAL_TYPE_BUY else 'SELL'}\n"
+                                f"Об'єм: {deal.volume}\n"
+                                f"Ціна закриття: {deal.price}\n"
+                                f"Прибуток: {profit}"
+                            )
+                            await send_telegram_message(msg)
+                            log_trade_result({
+                                "type": "close",
+                                "ticket": deal.ticket,
+                                "symbol": deal.symbol,
+                                "action": 'BUY' if deal.type == mt5.DEAL_TYPE_BUY else 'SELL',
+                                "volume": deal.volume,
+                                "close_price": deal.price,
+                                "profit": profit,
+                                "close_time": datetime.datetime.utcfromtimestamp(deal.time).isoformat()
+                            })
+            await asyncio.sleep(5)
+        except Exception as e:
+            logging.error(f"Помилка моніторингу закриття угод: {e}")
+            await asyncio.sleep(10)
 
 
-# --- 5. ГОЛОВНИЙ ЦИКЛ (ПРОСЛУХОВУВАННЯ WEBSOCKET) ---
+# --- 5. ГОЛОВНИЙ ЦИКЛ (ПРОСЛУХОВОВАННЯ WEBSOCKET) ---
 
 async def process_news_item(news_data: dict):
-    """Обробляє одну новину: фільтрує, аналізує та торгує."""
     try:
         title = news_data.get('title', '').lower()
-        
-        # Фільтрація за ключовими словами
-        if not any(keyword in title for keyword in IMPORTANT_KEYWORDS):
-            return # Ігноруємо неважливу новину
-
+        news_received_time = datetime.datetime.utcnow()
+        # --- Розширена фільтрація ---
+        filtered = False
+        reason = None
+        if any(bad in title for bad in NEWS_BLACKLIST):
+            filtered = True
+            reason = "blacklist"
+            log_news(news_data, filtered, reason)
+            logging.info(f"Новина проігнорована через blacklist: {news_data.get('title')}")
+            return
+        if not any(good in title for good in NEWS_WHITELIST):
+            filtered = True
+            reason = "not in whitelist"
+            log_news(news_data, filtered, reason)
+            logging.info(f"Новина не містить whitelist-ключових слів: {news_data.get('title')}")
+            return
+        impact = news_data.get('importance', 1)
+        if impact < MIN_NEWS_IMPORTANCE:
+            filtered = True
+            reason = f"impact={impact}"
+            log_news(news_data, filtered, reason)
+            logging.info(f"Новина має низьку важливість (impact={impact}): {news_data.get('title')}")
+            return
+        news_type = news_data.get('type', '').lower()
+        if news_type and news_type not in IMPORTANT_NEWS_TYPES:
+            filtered = True
+            reason = f"type={news_type}"
+            log_news(news_data, filtered, reason)
+            logging.info(f"Новина не входить до важливих типів: {news_data.get('title')}")
+            return
+        log_news(news_data, False)
         logging.info(f"Знайдено важливу новину: {news_data.get('title')}")
-        
-        # Отримання торгового сигналу
+        global RISK_PERCENT
+        RISK_PERCENT = dynamic_risk_percent(news_data)
         signal_data = await get_trade_signal(news_data.get('title'))
-        
+        openai_response_time = datetime.datetime.utcnow()
+        logging.info(f"OpenAI latency: {(openai_response_time - news_received_time).total_seconds():.2f} сек.")
         if signal_data:
             action, symbol, reason = signal_data
             if action in ["BUY", "SELL"]:
-                # Запускаємо торгівлю в окремому завданні, щоб не блокувати
-                asyncio.create_task(execute_trade(action, symbol, reason))
+                asyncio.create_task(execute_trade(action, symbol, reason, news_received_time=news_received_time))
             else:
                 logging.info(f"Отримано сигнал SKIP для новини. Торгівлю пропущено.")
-
     except Exception as e:
         logging.error(f"Критична помилка в обробці новини: {e}")
 
 
-async def benzinga_listener():
-    """Підключається до Benzinga WebSocket і слухає новини."""
-    uri = f"wss://api.benzinga.com/v1/news/stream?token={BENZINGA_API_KEY}"
-    
-    while True: # Цикл для автоматичного перепідключення
-        try:
-            async with connect(uri) as websocket:
-                logging.info("Підключено до Benzinga News Stream.")
-                await send_telegram_message("✅ Бот запущено. Підключено до стріму новин.")
-                
-                async for message in websocket:
-                    try:
-                        data = json.loads(message)
-                        if data.get('type') == 'news':
-                            # Запускаємо обробку новини асинхронно
-                            asyncio.create_task(process_news_item(data.get('data')))
-                    except json.JSONDecodeError:
-                        logging.warning(f"Не вдалося розпарсити JSON: {message}")
-                    except Exception as e:
-                        logging.error(f"Помилка обробки повідомлення з WebSocket: {e}")
+# --- Polygon.io REST API polling ---
+POLYGON_NEWS_URL = "https://api.polygon.io/v2/reference/news"
+last_polygon_news_id = None
 
-        except ConnectionClosed as e:
-            logging.warning(f"З'єднання з WebSocket закрито: {e}. Перепідключення через 10 секунд...")
+async def polygon_news_poller():
+    global last_polygon_news_id
+    while True:
+        try:
+            params = {"apiKey": POLYGON_API_KEY, "limit": 1}
+            response = requests.get(POLYGON_NEWS_URL, params=params)
+            data = response.json()
+            results = data.get("results", [])
+            if results:
+                news = results[0]
+                if news["id"] != last_polygon_news_id:
+                    last_polygon_news_id = news["id"]
+                    logging.info(f"НОВА НОВИНА (Polygon): {news['title']}")
+                    await process_news_item(news)
         except Exception as e:
-            logging.error(f"Критична помилка WebSocket: {e}. Перепідключення через 10 секунд...")
-        
+            logging.error(f"Помилка отримання новин Polygon: {e}")
+        await asyncio.sleep(2)  # polling кожні 2 секунди
+
+# --- Telegram-інтерфейс ---
+MAX_TRADES_PER_DAY = 10
+COOLDOWN_AFTER_LOSS = 600  # секунд (10 хвилин)
+last_trade_time = None
+last_trade_profit = 0
+cooldown_until = None
+trade_counter = {}
+
+async def stats_command(update, context):
+    """Відправляє статистику за день."""
+    try:
+        today = datetime.datetime.utcnow().date()
+        if os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = []
+        trades_today = [t for t in data if t.get("open_time", "").startswith(str(today))]
+        profit = sum(t.get("profit", 0) for t in trades_today if t["type"] == "close")
+        msg = f"Статистика за {today} UTC:\nКількість угод: {len(trades_today)}\nСумарний прибуток: {profit:.2f}"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Помилка stats: {e}")
+
+async def last_command(update, context):
+    """Відправляє інформацію про останню угоду."""
+    try:
+        if os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = []
+        if not data:
+            await update.message.reply_text("Ще не було жодної угоди.")
+            return
+        last = data[-1]
+        msg = f"Остання угода:\n{json.dumps(last, ensure_ascii=False, indent=2)}"
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Помилка last: {e}")
+
+async def help_command(update, context):
+    msg = "/stats — статистика за день\n/last — остання угода\n/help — ця довідка"
+    await update.message.reply_text(msg)
+
+# --- Ліміти та cooldown ---
+def can_trade(symbol):
+    global cooldown_until
+    now = datetime.datetime.utcnow()
+    today = now.date()
+    # Ліміт угод на день
+    if today not in trade_counter:
+        trade_counter.clear()
+        trade_counter[today] = 0
+    if trade_counter[today] >= MAX_TRADES_PER_DAY:
+        logging.info(f"Досягнуто ліміту угод на день: {MAX_TRADES_PER_DAY}")
+        return False
+    # Cooldown
+    if cooldown_until and now < cooldown_until:
+        logging.info(f"Активний cooldown до {cooldown_until}")
+        return False
+    return True
+
+def register_trade():
+    today = datetime.datetime.utcnow().date()
+    if today not in trade_counter:
+        trade_counter.clear()
+        trade_counter[today] = 0
+    trade_counter[today] += 1
+
+# --- Симулятор (структура для майбутнього) ---
+def run_simulation(news_history, strategy_func):
+    """Симулятор для тестування стратегії на історичних новинах."""
+    # news_history: список новин (dict)
+    # strategy_func: функція, яка приймає новину і повертає дію
+    results = []
+    for news in news_history:
+        action, symbol, reason = strategy_func(news)
+        # Тут можна симулювати відкриття/закриття угоди, рахувати прибуток тощо
+        results.append({"news": news, "action": action, "symbol": symbol, "reason": reason})
+    return results
+
+# --- Інтеграція Telegram-бота ---
+telegram_app = None
+
+def start_telegram_bot():
+    global telegram_app
+    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    telegram_app.add_handler(CommandHandler("stats", stats_command))
+    telegram_app.add_handler(CommandHandler("last", last_command))
+    telegram_app.add_handler(CommandHandler("help", help_command))
+    # Виправляємо помилку з event loop
+    import asyncio
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        telegram_app.run_polling()
+    except Exception as e:
+        logging.error(f"Помилка запуску Telegram-бота: {e}")
+
+# --- Модифікація monitor_closed_trades для cooldown ---
+async def monitor_closed_trades():
+    global cooldown_until
+    last_ticket_set = set()
+    while True:
+        try:
+            closed_orders = mt5.history_deals_get(datetime.datetime.now() - datetime.timedelta(days=2), datetime.datetime.now())
+            if closed_orders:
+                for deal in closed_orders:
+                    if deal.type in [mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL] and deal.entry == 1:
+                        if deal.ticket not in last_ticket_set:
+                            last_ticket_set.add(deal.ticket)
+                            profit = deal.profit
+                            if profit < 0:
+                                cooldown_until = datetime.datetime.utcnow() + datetime.timedelta(seconds=COOLDOWN_AFTER_LOSS)
+                            msg = (
+                                f"❌ Угоду закрито: {deal.symbol}\n"
+                                f"Тип: {'BUY' if deal.type == mt5.DEAL_TYPE_BUY else 'SELL'}\n"
+                                f"Об'єм: {deal.volume}\n"
+                                f"Ціна закриття: {deal.price}\n"
+                                f"Прибуток: {profit}"
+                            )
+                            await send_telegram_message(msg)
+                            log_trade_result({
+                                "type": "close",
+                                "ticket": deal.ticket,
+                                "symbol": deal.symbol,
+                                "action": 'BUY' if deal.type == mt5.DEAL_TYPE_BUY else 'SELL',
+                                "volume": deal.volume,
+                                "close_price": deal.price,
+                                "profit": profit,
+                                "close_time": datetime.datetime.utcfromtimestamp(deal.time).isoformat()
+                            })
+            await asyncio.sleep(5)
+        except Exception as e:
+            logging.error(f"Помилка моніторингу закриття угод: {e}")
         await asyncio.sleep(10)
 
+# --- Запуск Telegram-бота у окремому потоці ---
+import threading as _threading
 
+def start_telegram_thread():
+    t = _threading.Thread(target=start_telegram_bot, daemon=True)
+    t.start()
+
+# --- main ---
 if __name__ == "__main__":
-    if not all([BENZINGA_API_KEY, OPENAI_API_KEY, OPENAI_ASSISTANT_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+    if not all([OPENAI_API_KEY, OPENAI_ASSISTANT_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, POLYGON_API_KEY]):
         logging.critical("Не всі необхідні змінні середовища встановлені. Перевірте ваш .env файл.")
     elif not initialize_mt5():
         logging.critical("Вихід з програми через помилку підключення до MT5.")
     else:
         try:
-            asyncio.run(benzinga_listener())
+            start_telegram_thread()
+            loop = asyncio.get_event_loop()
+            loop.create_task(polygon_news_poller())
+            loop.create_task(monitor_closed_trades())
+            loop.run_forever()
         except KeyboardInterrupt:
             logging.info("Бот зупинено вручну.")
         finally:
